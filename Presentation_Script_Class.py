@@ -8,6 +8,8 @@ import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import Element, SubElement
 from collections import defaultdict
 from pathlib import Path
+import time
+import re
 
 
 class PowerPointTemplate:
@@ -42,14 +44,28 @@ class PowerPointTemplate:
         '.webp': 'image/webp',
     }
 
-    def __init__(self, template_path):
+    def __init__(self, template_path):  
         """Initialize with a template PPTX file."""
         self.template_path = template_path
         self.tracker = ReplacementTracker()
-
-        # Register namespaces for clean XML output
+        
+        # Create temp working directory for this instance
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self.tmp_path = os.path.join(self._tmp_dir.name, f"{hash(time.time())}_working.pptx")
+        
+        # Initialize tmp file as a copy of template
+        shutil.copy2(self.template_path, self.tmp_path)
+        
+        # Set tracker template path
+        self.tracker.template_path = template_path
+        
+        # Register namespaces
         for prefix, uri in self.NSMAP.items():
             ET.register_namespace(prefix, uri)
+            
+    def __del__(self):
+        self.cleanup()
+
 
     # ========== Image Format Helpers ==========
     @classmethod
@@ -347,87 +363,9 @@ class PowerPointTemplate:
                     child, zip_ref, slide_rels_xml, parent_offset, group_chain)
                 yield (child, spTree, abs_l, abs_t, abs_w, abs_h, full_text, None)
 
-    # ========== Main Operations ==========
-    def replace(self, placeholder_map, output_path=None, **kwargs):
-        """
-        Replace placeholders with images. Automatically detects and handles:
-        - SVG files (.svg) → inserted as vector graphics
-        - PNG files (.png) → inserted as raster images
-        - JPEG files (.jpg, .jpeg) → inserted as raster images
-        - GIF files (.gif) → inserted as raster images
-        - BMP files (.bmp) → inserted as raster images
-        - TIFF files (.tiff, .tif) → inserted as raster images
-        - WebP files (.webp) → inserted as raster images
-        - Matplotlib figures → converted to SVG by default
-        - Raw bytes → format auto-detected
-        
-        Args:
-            placeholder_map: Dict mapping placeholder text to:
-                - str/Path: path to an image file
-                - matplotlib.figure.Figure: a matplotlib figure
-                - bytes: raw image data
-                - tuple: (bytes, filename) for format detection
-            output_path: Output PPTX path
-            **kwargs: For matplotlib figures: format='svg'|'png', dpi, transparent
-        
-        Returns:
-            Path to output file
-        
-        Example:
-            ppt = PowerPointTemplate('template.pptx')
-            ppt.replace({
-                '{Logo}': 'logo.svg',              # SVG file
-                '{Photo}': 'photo.png',            # PNG file
-                '{Chart}': matplotlib_figure,       # matplotlib figure
-                '{Icon}': b'<svg>...</svg>',       # raw SVG bytes
-                '{Graph}': (png_bytes, 'graph.png'), # bytes with filename hint
-            })
-        """
-        if output_path is None:
-            base, ext = os.path.splitext(self.template_path)
-            output_path = f"{base}_replaced{ext}"
-        
-        image_map = {}  # {search_text: (image_data, extension, mime_type)}
-        
-        for search_text, value in placeholder_map.items():
-            # Handle tuples: (bytes, filename)
-            if isinstance(value, tuple) and len(value) == 2:
-                data, filename = value
-                ext, mime = self._get_image_format(data, filename)
-                image_map[search_text] = (data, ext, mime)
-            
-            # Handle matplotlib figures
-            elif hasattr(value, 'savefig'):
-                fmt = kwargs.get('format', 'svg')
-                data, ext = self._fig_to_image(value, format=fmt, **kwargs)
-                mime = self.IMAGE_FORMATS.get(ext, 'image/png')
-                image_map[search_text] = (data, ext, mime)
-            
-            # Handle raw bytes
-            elif isinstance(value, bytes):
-                ext, mime = self._get_image_format(value)
-                image_map[search_text] = (value, ext, mime)
-            
-            # Handle file paths (str or Path)
-            elif isinstance(value, (str, Path)):
-                path = Path(value)
-                ext = path.suffix.lower()
-                mime = self.IMAGE_FORMATS.get(ext, 'image/png')
-                with open(path, 'rb') as f:
-                    data = f.read()
-                image_map[search_text] = (data, ext, mime)
-            
-            else:
-                raise TypeError(
-                    f"Unsupported type for '{search_text}': {type(value)}. "
-                    f"Expected str (file path), bytes, tuple, or matplotlib Figure."
-                )
-        
-        return self._replace_with_images(image_map, output_path)
-
-    def _replace_with_images(self, image_map, output_path):
+    def _replace_with_images(self, image_map):
         """Core replacement logic that handles multiple image formats."""
-        with zipfile.ZipFile(self.template_path, 'r') as zin:
+        with zipfile.ZipFile(self.tmp_path, 'r') as zin:
             with zin.open('[Content_Types].xml') as f:
                 ct_tree = ET.parse(f)
             
@@ -485,7 +423,9 @@ class PowerPointTemplate:
                 modified[slide_file] = ET.tostring(slide_root, encoding='UTF-8', xml_declaration=True)
                 modified[rels_name] = ET.tostring(rels_root, encoding='UTF-8', xml_declaration=True)
 
-            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            new_zip_path = self.tmp_path + ".new"
+            
+            with zipfile.ZipFile(new_zip_path, 'w', zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
                     if item.filename in modified:
                         zout.writestr(item, modified[item.filename])
@@ -493,21 +433,141 @@ class PowerPointTemplate:
                         zout.writestr(item, ET.tostring(ct_tree.getroot(), encoding='UTF-8', xml_declaration=True))
                     else:
                         zout.writestr(item, zin.read(item.filename))
-
-                # Write image files with correct extensions
+            
+                # Write images
                 img_assignments = {}
                 for r in self.tracker.replacements:
                     img_num = int(r['picture_name'].split('_')[-1])
                     search_text = r['placeholder_text']
                     img_data, ext, _ = image_map[search_text]
                     img_assignments[img_num] = (img_data, ext)
-
+            
                 for img_num, (img_data, ext) in img_assignments.items():
                     zout.writestr(f'ppt/media/image{img_num}{ext}', img_data)
 
-        return output_path
+        # Replace original safely
+        shutil.move(new_zip_path, self.tmp_path)
 
-    def apply_adjustments(self, adjusted_pptx_path, output_path=None):
+
+        return
+    
+    # ========== Main Operations ==========
+    def replace(self, placeholder_map):
+        pass
+    
+    def replace_image(self, placeholder_map:dict, **kwargs):
+        """
+        Replace placeholders with images. Automatically detects and handles:
+        - SVG files (.svg) → inserted as vector graphics
+        - PNG files (.png) → inserted as raster images
+        - JPEG files (.jpg, .jpeg) → inserted as raster images
+        - GIF files (.gif) → inserted as raster images
+        - BMP files (.bmp) → inserted as raster images
+        - TIFF files (.tiff, .tif) → inserted as raster images
+        - WebP files (.webp) → inserted as raster images
+        - Matplotlib figures → converted to SVG by default
+        - Raw bytes → format auto-detected
+        
+        Args:
+            placeholder_map: Dict mapping placeholder text to:
+                - str/Path: path to an image file
+                - matplotlib.figure.Figure: a matplotlib figure
+                - bytes: raw image data
+                - tuple: (bytes, filename) for format detection
+            output_path: Output PPTX path
+            **kwargs: For matplotlib figures: format='svg'|'png', dpi, transparent
+        
+        Returns:
+            Path to output file
+        
+        Example:
+            ppt = PowerPointTemplate('template.pptx')
+            ppt.replace({
+                '{Logo}': 'logo.svg',              # SVG file
+                '{Photo}': 'photo.png',            # PNG file
+                '{Chart}': matplotlib_figure,       # matplotlib figure
+                '{Icon}': b'<svg>...</svg>',       # raw SVG bytes
+                '{Graph}': png_bytes, # bytes with filename hint
+            })
+        """
+        output_path = self.tmp_path
+        
+        image_map = {}  # {search_text: (image_data, extension, mime_type)}
+        
+        for search_text, value in placeholder_map.items():
+            # Handle tuples: (bytes, filename)
+            if isinstance(value, tuple) and len(value) == 2:
+                data, filename = value
+                ext, mime = self._get_image_format(data, filename)
+                image_map[search_text] = (data, ext, mime)
+            
+            # Handle matplotlib figures
+            elif hasattr(value, 'savefig'):
+                fmt = kwargs.get('format', 'svg')
+                data, ext = self._fig_to_image(value, format=fmt, **kwargs)
+                mime = self.IMAGE_FORMATS.get(ext, 'image/png')
+                image_map[search_text] = (data, ext, mime)
+            
+            # Handle raw bytes
+            elif isinstance(value, bytes):
+                ext, mime = self._get_image_format(value)
+                image_map[search_text] = (value, ext, mime)
+            
+            # Handle file paths (str or Path)
+            elif isinstance(value, (str, Path)):
+                path = Path(value)
+                ext = path.suffix.lower()
+                mime = self.IMAGE_FORMATS.get(ext, 'image/png')
+                with open(path, 'rb') as f:
+                    data = f.read()
+                image_map[search_text] = (data, ext, mime)
+            
+            else:
+                raise TypeError(
+                    f"Unsupported type for '{search_text}': {type(value)}. "
+                    f"Expected str (file path), bytes, tuple, or matplotlib Figure."
+                )
+        
+        return self._replace_with_images(image_map)
+    
+    
+    def replace_text(self, placeholder_map: dict):
+        """
+        Replace text placeholders in a PowerPoint presentation.
+    
+        Args:
+            placeholder_map: dict mapping keys -> replacement text
+                  e.g. {"Title": "New Title"} replaces {Title}
+            save_location: where to save output
+            save: whether to save file
+    
+        Returns:
+            Presentation object
+        """
+        from pptx import Presentation as PPTXPresentation
+    
+        # Load if a path is provided
+        prs = PPTXPresentation(self.tmp_path)
+    
+        # Build placeholder mapping: {Key} -> value
+        replacer = {f'{{{k}}}': str(v) for k, v in placeholder_map.items()}
+    
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    # Only process shapes that actually contain placeholders
+                    if "{" in shape.text and "}" in shape.text:
+                        for old, new in replacer.items():
+                            if old in shape.text:
+                                shape.text = shape.text.replace(old, new)
+    
+        # Handle saving
+        prs.save(self.tmp_path)
+        
+        return
+
+
+    def update_template(self, adjusted_pptx_path, output_path=None):
         """Create a new template with text boxes at the adjusted positions."""
         if output_path is None:
             base, ext = os.path.splitext(self.template_path)
@@ -615,13 +675,269 @@ class PowerPointTemplate:
                         zout.writestr(item, zin.read(item.filename))
 
         return output_path
+    
+    def cleanup(self):
+        self._tmp_dir.cleanup()
+    
+    def save(self, output_path):
+        shutil.copy2(self.tmp_path, output_path)
+        self.tracker.output_path = output_path
 
 
 class ReplacementTracker:
     """Tracks which placeholders were replaced and their geometry."""
+    
 
     def __init__(self):
         self.replacements = []
+        self.template_path = None
+        self.output_path = None
+        
+    @staticmethod
+    def _extract_asset_geoms(pptx_path):
+        import zipfile
+        import xml.etree.ElementTree as ET
+    
+        NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    
+        geoms = {}
+    
+        def get_off_ext(xfrm):
+            off = xfrm.find(f"{{{NS_A}}}off")
+            ext = xfrm.find(f"{{{NS_A}}}ext")
+    
+            if off is None or ext is None:
+                return None
+    
+            return (
+                int(off.get("x", 0)),
+                int(off.get("y", 0)),
+                int(ext.get("cx", 0)),
+                int(ext.get("cy", 0)),
+            )
+    
+        def walk(node, acc_x=0, acc_y=0):
+    
+            tag = node.tag.split("}")[-1]
+    
+            # -------------------------
+            # GROUP (CRITICAL FIX)
+            # -------------------------
+            if tag == "grpSp":
+    
+                xfrm = node.find(f".//{{{NS_P}}}grpSpPr/{{{NS_A}}}xfrm")
+                if xfrm is not None:
+                    off = xfrm.find(f"{{{NS_A}}}off")
+                    if off is not None:
+                        acc_x += int(off.get("x", 0))
+                        acc_y += int(off.get("y", 0))
+    
+                for child in node:
+                    walk(child, acc_x, acc_y)
+    
+            # -------------------------
+            # PICTURE
+            # -------------------------
+            elif tag == "pic":
+    
+                cNvPr = node.find(f".//{{{NS_P}}}cNvPr")
+                xfrm = node.find(f".//{{{NS_P}}}spPr/{{{NS_A}}}xfrm")
+    
+                if cNvPr is None or xfrm is None:
+                    return
+    
+                name = cNvPr.get("name")
+    
+                geom = get_off_ext(xfrm)
+                if geom is None:
+                    return
+    
+                x, y, w, h = geom
+    
+                # FINAL ACCUMULATED POSITION
+                geoms[name] = (acc_x + x, acc_y + y, w, h)
+    
+            # -------------------------
+            # RECURSE
+            # -------------------------
+            for child in node:
+                walk(child, acc_x, acc_y)
+    
+        # -------------------------
+        # READ PPTX
+        # -------------------------
+        with zipfile.ZipFile(pptx_path, "r") as z:
+    
+            slides = [
+                n for n in z.namelist()
+                if n.startswith("ppt/slides/slide")
+                and n.endswith(".xml")
+                and "_rels" not in n
+            ]
+    
+            for slide_file in slides:
+                slide_num = int(slide_file[len("ppt/slides/slide"):-4])
+                root = ET.fromstring(z.read(slide_file))
+    
+                spTree = root.find(f".//{{{NS_P}}}spTree")
+                if spTree is None:
+                    continue
+    
+                walk(spTree)
+    
+                # attach slide number
+                for k, v in list(geoms.items()):
+                    geoms[(slide_num, k)] = v
+                    del geoms[k]
+    
+        return geoms
+    
+    @staticmethod
+    def _extract_text_geoms(pptx_path):
+        import zipfile
+        import xml.etree.ElementTree as ET
+    
+        NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    
+        results = {}
+    
+        def get_xywh(node):
+            xfrm = node.find(f".//{{{NS_P}}}xfrm")
+            if xfrm is None:
+                return None
+    
+            off = xfrm.find(f"{{{NS_A}}}off")
+            ext = xfrm.find(f"{{{NS_A}}}ext")
+    
+            if off is None or ext is None:
+                return None
+    
+            return (
+                int(off.get("x", 0)),
+                int(off.get("y", 0)),
+                int(ext.get("cx", 0)),
+                int(ext.get("cy", 0)),
+            )
+    
+        def extract_text(node):
+            return "".join(
+                t.text or ""
+                for t in node.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/main}t")
+            ).strip()
+    
+        def walk(node, slide_num, acc_x=0, acc_y=0):
+    
+            tag = node.tag.split("}")[-1]
+    
+            # -------------------------
+            # GROUPS
+            # -------------------------
+            if tag == "grpSp":
+                xfrm = node.find(f".//{{{NS_P}}}grpSpPr/{{{NS_A}}}xfrm")
+    
+                if xfrm is not None:
+                    off = xfrm.find(f"{{{NS_A}}}off")
+                    if off is not None:
+                        acc_x += int(off.get("x", 0))
+                        acc_y += int(off.get("y", 0))
+    
+                for child in node:
+                    walk(child, slide_num, acc_x, acc_y)
+    
+                return
+    
+            # -------------------------
+            # SHAPES (normal textboxes)
+            # -------------------------
+            if tag == "sp":
+                txBody = node.find(f".//{{{NS_P}}}txBody")
+                if txBody is not None:
+                    text = extract_text(txBody)
+    
+                    if text:
+                        geom = get_xywh(node)
+                        if geom:
+                            x, y, w, h = geom
+    
+                            cNvPr = node.find(f".//{{{NS_P}}}cNvPr")
+                            shape_id = cNvPr.get("id") if cNvPr is not None else None
+                            name = cNvPr.get("name") if cNvPr is not None else None
+    
+                            key = (slide_num, shape_id or name)
+    
+                            results[key] = {
+                                "text": text,
+                                "name": name,
+                                "left": acc_x + x,
+                                "top": acc_y + y,
+                                "width": w,
+                                "height": h,
+                            }
+    
+            # -------------------------
+            # TABLES (CRITICAL FIX)
+            # -------------------------
+            if tag == "graphicFrame":
+                text_nodes = node.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/main}t")
+                if text_nodes:
+                    text = "".join(t.text or "" for t in text_nodes).strip()
+    
+                    if text:
+                        geom = get_xywh(node)
+                        if geom:
+                            x, y, w, h = geom
+    
+                            cNvPr = node.find(f".//{{{NS_P}}}cNvPr")
+                            shape_id = cNvPr.get("id") if cNvPr is not None else None
+                            name = cNvPr.get("name") if cNvPr is not None else None
+    
+                            key = (slide_num, shape_id or name or f"table_{len(results)}")
+    
+                            results[key] = {
+                                "text": text,
+                                "name": name,
+                                "left": acc_x + x,
+                                "top": acc_y + y,
+                                "width": w,
+                                "height": h,
+                            }
+    
+            # -------------------------
+            # CONTINUE WALK
+            # -------------------------
+            for child in node:
+                walk(child, slide_num, acc_x, acc_y)
+    
+        # -------------------------
+        # READ PPTX
+        # -------------------------
+        with zipfile.ZipFile(pptx_path, "r") as z:
+            slides = [
+                n for n in z.namelist()
+                if n.startswith("ppt/slides/slide")
+                and n.endswith(".xml")
+                and "_rels" not in n
+            ]
+    
+            for slide_file in slides:
+                import re
+                m = re.search(r"slide(\d+)\.xml$", slide_file)
+                if not m:
+                    continue
+    
+                slide_num = int(m.group(1))
+    
+                root = ET.fromstring(z.read(slide_file))
+                spTree = root.find(f".//{{{NS_P}}}spTree")
+    
+                if spTree is None:
+                    continue
+    
+                walk(spTree, slide_num)
+    
+        return results
 
     def add_replacement(self, slide_num, placeholder_text, picture_name,
                         template_position, template_size):
@@ -651,25 +967,114 @@ class ReplacementTracker:
                 print(f"     Output:   ({r['output_geometry']['left']}, {r['output_geometry']['top']}) "
                       f"{r['output_geometry']['width']}×{r['output_geometry']['height']}")
         print("=" * 60)
+        
+    def update(self):
+        """
+        Reconcile replacements with actual output PPTX geometry.
+        """
+    
+        if self.output_path is None:
+            raise Exception("Save an output first to use as the example for the new template")
+    
+        import zipfile
+        import xml.etree.ElementTree as ET
+    
+        NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    
+        # ----------------------------
+        # 1. Extract both PPTX states
+        # ----------------------------
+        template_geoms = self._extract_asset_geoms(self.template_path)
+        output_geoms = self._extract_asset_geoms(self.output_path)
+    
+        # ----------------------------
+        # 2. Update tracker
+        # ----------------------------
+        updated = 0
+    
+        for r in self.replacements:
+    
+            slide = r["slide"]
+    
+            # ----------------------------
+            # PRIMARY MATCH (BEST)
+            # ----------------------------
+            key = (slide, r["picture_name"])
+    
+            if key in output_geoms:
+                l, t, w, h = output_geoms[key]
+    
+                r["output_geometry"] = {
+                    "left": l,
+                    "top": t,
+                    "width": w,
+                    "height": h,
+                }
+    
+                updated += 1
+                continue
+    
+        return updated
+    
+    def save(self, path):
+        """
+        Save tracker state to disk (JSON).
+        """
+    
+        import json
+    
+        payload = {
+            "template_path": self.template_path,
+            "output_path": self.output_path,
+            "replacements": self.replacements,
+        }
+    
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    
+        return 
+    
+    @classmethod
+    def load(cls, path):
+        """
+        Load tracker state from disk (JSON).
+        Returns a ReplacementTracker instance.
+        """
+    
+        import json
+    
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    
+        obj = cls()
+        obj.template_path = payload.get("template_path")
+        obj.output_path = payload.get("output_path")
+        obj.replacements = payload.get("replacements", [])
+    
+        return obj
 
 
 # ---------- Example usage ----------
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
+    from RBNZ_Toolbox import aplot
+    from RBNZ_Data import ffs
     
-    # Create a matplotlib figure
-    fig, ax = plt.subplots()
-    ax.plot([1, 1, 3, 4], [1, 4, 9, 16])
-    ax.set_title('Sample Chart')
+    data, ax = aplot(ffs.get('LVRN.MMB1.AA', table=True))
     
-    ppt = PowerPointTemplate(r'C:/Development/Powerpoint/Test.pptx')
+    ppt = PowerPointTemplate(r'C:/Development/Presentation_Automation/Test.pptx')
     
-    # Single method handles ALL formats automatically
-    out = ppt.replace({
-        '{CompanyLogo}': r'C:/Development/Powerpoint/test.svg',    # SVG
-        '{Photo}': r'C:\Development\Powerpoint\test.png',         # PNG
-        '{Chart}': fig,                                              # matplotlib figure (→ SVG)
-        '{Graph}': open(r'C:\Development\Powerpoint\test.png', 'rb').read(),   # bytes + filename hint
-    }, output_path=r'C:/Development/Powerpoint/Test3.pptx')
+    out = ppt.replace_image({
+        '{Chart 1}': ax['fig'],
+        '{Chart 2}': ax['fig']
+    }
+        )
     
-    ppt.tracker.print_report()
+    out = ppt.replace_text({'Title1':'Title will be here'})
+    
+    ppt.save(r'C:/Development/Presentation_Automation/Test_Output.pptx')
+    
+    ppt.tracker.update()
+    
+    ppt.update_template(r'C:/Development/Presentation_Automation/Test_Output.pptx', r'C:\Development\Presentation_Automation/New_template1.pptx')
