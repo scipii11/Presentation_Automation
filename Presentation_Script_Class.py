@@ -139,6 +139,38 @@ class PowerPointTemplate:
                 except:
                     pass
         return f'rId{max_id + 1}'
+    
+    @staticmethod
+    def find_textbox_xml(pptx_path, search_text):
+        """Print the full XML of the first shape containing `search_text`."""
+        NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    
+        with zipfile.ZipFile(pptx_path, 'r') as z:
+            slide_files = [n for n in z.namelist()
+                           if n.startswith('ppt/slides/slide') and n.endswith('.xml') and '_rels' not in n]
+            for slide_file in sorted(slide_files):
+                slide_xml = z.read(slide_file)
+                root = ET.fromstring(slide_xml)
+                spTree = root.find(f'.//{{{NS_P}}}spTree')
+                if spTree is None:
+                    continue
+                for shape in spTree.iter():
+                    tag = shape.tag.split('}')[-1]
+                    if tag not in ('sp', 'graphicFrame'):
+                        continue
+                    txBody = shape.find(f'{{{NS_P}}}txBody')
+                    if txBody is None:
+                        continue
+                    # collect all text
+                    texts = [t.text or '' for t in txBody.findall(f'.//{{{NS_A}}}t')]
+                    full_text = ''.join(texts)
+                    if search_text in full_text:
+                        # found the shape — pretty‑print its XML
+                        print(f"Found '{search_text}' in {slide_file}")
+                        print(ET.tostring(shape, encoding='unicode'))
+                        return  # stop after first match
+            print(f"Text '{search_text}' not found in {pptx_path}")
 
     @staticmethod
     def _make_pic_element(left, top, width, height, rel_id, shape_name):
@@ -669,6 +701,165 @@ class PowerPointTemplate:
                         zout.writestr(item, zin.read(item.filename))
 
         return output_template_path
+    
+    def update_template(self, output_template_path=None):
+        
+        #Update Tracker
+        self.tracker.update()
+        
+        if output_template_path is None:
+            base, ext = os.path.splitext(self.template_path)
+            output_template_path = f"{base}_adjusted{ext}"
+    
+        if not any(r.get('output_geometry') for r in self.tracker.replacements):
+            print("WARNING: No output geometries found. Call tracker.update() first.")
+            shutil.copy2(self.template_path, output_template_path)
+            return output_template_path
+    
+        # Pre‑load output slides
+        output_slides = {}
+        with zipfile.ZipFile(self.tracker.output_path, 'r') as zout:
+            for r in self.tracker.replacements:
+                slide_file = f'ppt/slides/slide{r["slide"]}.xml'
+                if slide_file not in output_slides:
+                    output_slides[slide_file] = ET.fromstring(zout.read(slide_file))
+    
+        with zipfile.ZipFile(self.template_path, 'r') as zin:
+            modified_slides = {}
+            for r in self.tracker.replacements:
+                out_geom = r.get('output_geometry')
+                if out_geom is None:
+                    continue
+                slide_num = r['slide']
+                slide_file = f'ppt/slides/slide{slide_num}.xml'
+    
+                if slide_num not in modified_slides:
+                    slide_xml = zin.read(slide_file)
+                    slide_root = ET.fromstring(slide_xml)
+                    modified_slides[slide_num] = slide_root
+    
+                spTree = modified_slides[slide_num].find(f'{{{self.NS_P}}}cSld/{{{self.NS_P}}}spTree')
+                if spTree is None:
+                    continue
+    
+                placeholder = r['placeholder_text']
+                found = False
+                for shape in spTree.iter():
+                    tag = shape.tag.split('}')[-1]
+                    if tag not in ('sp', 'graphicFrame'):
+                        continue
+                    txBody = shape.find(f'{{{self.NS_P}}}txBody')
+                    if txBody is None:
+                        continue
+    
+                    texts = [t.text or '' for t in txBody.findall(f'.//{{{self.NS_A}}}t')]
+                    full_text = ''.join(texts)
+                    if placeholder not in full_text:
+                        continue
+    
+                    # ---- 1. Move / resize ----
+                    xfrm = shape.find(f'{{{self.NS_P}}}spPr/{{{self.NS_A}}}xfrm')
+                    if xfrm is not None:
+                        off = xfrm.find(f'{{{self.NS_A}}}off')
+                        ext = xfrm.find(f'{{{self.NS_A}}}ext')
+                        off.set('x', str(out_geom['left']))
+                        off.set('y', str(out_geom['top']))
+                        ext.set('cx', str(out_geom['width']))
+                        ext.set('cy', str(out_geom['height']))
+    
+                    # ---- 2. Inherit formatting from output shape ----
+                    if slide_file in output_slides:
+                        out_root = output_slides[slide_file]
+                        out_spTree = out_root.find(f'{{{self.NS_P}}}cSld/{{{self.NS_P}}}spTree')
+                        if out_spTree is not None:
+                            for out_shape in out_spTree.iter():
+                                # 🔧 FIXED: recursively find cNvPr (was `find`, now `findall` with `.//`)
+                                out_cNvPr = out_shape.find(f'.//{{{self.NS_P}}}cNvPr')
+                                if out_cNvPr is not None and out_cNvPr.get('name') == r['picture_name']:
+                                    out_txBody = out_shape.find(f'.//{{{self.NS_P}}}txBody')
+                                    if out_txBody is not None:
+                                        # --- Body properties ---
+                                        tmpl_bodyPr = txBody.find(f'{{{self.NS_A}}}bodyPr')
+                                        out_bodyPr = out_txBody.find(f'{{{self.NS_A}}}bodyPr')
+                                        if tmpl_bodyPr is not None and out_bodyPr is not None:
+                                            tmpl_bodyPr.attrib.clear()
+                                            tmpl_bodyPr.attrib.update(out_bodyPr.attrib)
+                                            for child in list(tmpl_bodyPr):
+                                                tmpl_bodyPr.remove(child)
+                                            for child in out_bodyPr:
+                                                tmpl_bodyPr.append(copy.deepcopy(child))
+    
+                                        # --- Paragraph and run formatting ---
+                                        tmpl_paras = txBody.findall(f'{{{self.NS_A}}}p')
+                                        out_paras = out_txBody.findall(f'{{{self.NS_A}}}p')
+                                        for tp, op in zip(tmpl_paras, out_paras):
+                                            # paragraph properties (pPr)
+                                            tp_pPr = tp.find(f'{{{self.NS_A}}}pPr')
+                                            op_pPr = op.find(f'{{{self.NS_A}}}pPr')
+                                            if op_pPr is not None:
+                                                if tp_pPr is None:
+                                                    tp_pPr = Element(f'{{{self.NS_A}}}pPr')
+                                                    tp.insert(0, tp_pPr)
+                                                for child in list(tp_pPr):
+                                                    tp_pPr.remove(child)
+                                                for child in op_pPr:
+                                                    tp_pPr.append(copy.deepcopy(child))
+                                                tp_pPr.attrib.clear()
+                                                tp_pPr.attrib.update(op_pPr.attrib)
+                                            elif tp_pPr is not None:
+                                                tp.remove(tp_pPr)
+    
+                                            # end paragraph run properties
+                                            tp_end = tp.find(f'{{{self.NS_A}}}endParaRPr')
+                                            op_end = op.find(f'{{{self.NS_A}}}endParaRPr')
+                                            if op_end is not None:
+                                                if tp_end is None:
+                                                    tp_end = Element(f'{{{self.NS_A}}}endParaRPr')
+                                                    tp.append(tp_end)
+                                                for child in list(tp_end):
+                                                    tp_end.remove(child)
+                                                for child in op_end:
+                                                    tp_end.append(copy.deepcopy(child))
+                                                tp_end.attrib.clear()
+                                                tp_end.attrib.update(op_end.attrib)
+                                            elif tp_end is not None:
+                                                tp.remove(tp_end)
+    
+                                            # runs
+                                            tmpl_runs = tp.findall(f'{{{self.NS_A}}}r')
+                                            out_runs = op.findall(f'{{{self.NS_A}}}r')
+                                            for tr, or_ in zip(tmpl_runs, out_runs):
+                                                tr_rPr = tr.find(f'{{{self.NS_A}}}rPr')
+                                                or_rPr = or_.find(f'{{{self.NS_A}}}rPr')
+                                                if or_rPr is not None:
+                                                    if tr_rPr is None:
+                                                        tr_rPr = Element(f'{{{self.NS_A}}}rPr')
+                                                        tr.insert(0, tr_rPr)
+                                                    for child in list(tr_rPr):
+                                                        tr_rPr.remove(child)
+                                                    for child in or_rPr:
+                                                        tr_rPr.append(copy.deepcopy(child))
+                                                    tr_rPr.attrib.clear()
+                                                    tr_rPr.attrib.update(or_rPr.attrib)
+                                                elif tr_rPr is not None:
+                                                    tr.remove(tr_rPr)
+                                    break   # output shape matched
+                    found = True
+                    break
+    
+                if not found:
+                    print(f"WARNING: Placeholder '{placeholder}' not found on slide {slide_num} in template.")
+    
+            # ---- Write the new template ----
+            with zipfile.ZipFile(output_template_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename in [f'ppt/slides/slide{num}.xml' for num in modified_slides]:
+                        slide_num = int(item.filename[len('ppt/slides/slide'):-4])
+                        zout.writestr(item, ET.tostring(modified_slides[slide_num], encoding='UTF-8', xml_declaration=True))
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+    
+        return output_template_path
 
     def save(self, output_path):
         shutil.copy2(self.tmp_path, output_path)
@@ -750,13 +941,33 @@ class ReplacementTracker:
 if __name__ == '__main__':
     # Create a simple matplotlib plot
     import matplotlib.pyplot as plt
-    from RBNZ_Toolbox import aplot
+    # from RBNZ_Toolbox import aplot
     
-    fig1 = aplot('LVRN.MMB1.AC1', table=True)[1]['fig']
-    fig2 = aplot('LVRN.MMB1.AC2', table=True)[1]['fig']
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Create first figure (line plot)
+    x1 = np.linspace(0, 10, 100)
+    y1 = np.sin(x1)
+    fig1, ax1 = plt.subplots(figsize=(6, 4))
+    ax1.plot(x1, y1, color='blue', linewidth=2)
+    ax1.set_title('Sine Wave')
+    ax1.set_xlabel('x')
+    ax1.set_ylabel('sin(x)')
+    ax1.grid(True, alpha=0.3)
+    
+    # Create second figure (bar chart)
+    categories = ['A', 'B', 'C', 'D']
+    values = [23, 45, 56, 78]
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
+    ax2.bar(categories, values, color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+    ax2.set_title('Sample Bar Chart')
+    ax2.set_xlabel('Category')
+    ax2.set_ylabel('Value')
+    ax2.grid(axis='y', alpha=0.3)
 
     # Load template and perform replacements
-    ppt = PowerPointTemplate(r'C:/Development/Presentation_Automation/Test.pptx')
+    ppt = PowerPointTemplate(r'C:/Development/Powerpoint_Automation/Test.pptx')
 
     # Replace image placeholder {Chart 1} with the matplotlib figure
     ppt.replace_image({
@@ -770,7 +981,7 @@ if __name__ == '__main__':
     })
 
     # Save the output
-    ppt.save(r'C:/Development/Presentation_Automation/Test2.pptx')
+    ppt.save(r'C:/Development/Powerpoint_Automation/Test3.pptx')
     print("Saved output:")
 
     # Show the tracker report – you'll see both the image and text replacements recorded
@@ -781,7 +992,8 @@ if __name__ == '__main__':
     # then call update_template with that edited output.
     # For demonstration, we'll just use the same output (no actual changes).
     # The tracker will read the output geometries and prepare to adjust the template.
-    ppt.tracker.update()  # This will now do nothing because the output is the same as saved.
+    # ppt.tracker.update()  # This will now do nothing because the output is the same as saved.
     ppt.tracker.print_report()
-    ppt.update_template(r'C:/Development/Presentation_Automation/New_Template.pptx')
+    # input("")
+    ppt.update_template(r'C:/Development/Powerpoint_Automation/New_Template.pptx')
     # print("Updated template saved:", new_template_path)
