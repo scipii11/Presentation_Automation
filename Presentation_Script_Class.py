@@ -595,12 +595,15 @@ class PowerPointTemplate:
                 found = False
                 for shape in spTree.iter():
                     tag = shape.tag.split('}')[-1]
-                    if tag in ('sp', 'pic', 'graphicFrame'):
-                        txBody = shape.find(f'{{{self.NS_P}}}txBody')
-                        if txBody is None:
-                            continue
-                        texts = [t.text or '' for t in txBody.findall(f'.//{{{self.NS_A}}}t')]
-                        full_text = ''.join(texts)
+                    # print(tag)
+                    if tag == 'sp': #in ('sp', 'pic', 'graphicFrame'):
+                        texts = shape.text
+                        if texts is None:
+                            txBody = shape.find(f'{{{self.NS_P}}}txBody')
+                            if txBody is None:
+                                continue
+                            texts = [t.text or '' for t in txBody.findall(f'.//{{{self.NS_A}}}t')]
+                            full_text = ''.join(texts)
                         if placeholder in full_text:
                             # 1. Move / resize
                             xfrm = shape.find(f'{{{self.NS_P}}}spPr/{{{self.NS_A}}}xfrm')
@@ -747,25 +750,27 @@ class ReplacementTracker:
 if __name__ == '__main__':
     # Create a simple matplotlib plot
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots()
-    ax.plot([0, 1, 2, 3, 4], [0, 1, 4, 9, 16], marker='o')
-    ax.set_title('Example Chart')
+    from RBNZ_Toolbox import aplot
+    
+    fig1 = aplot('LVRN.MMB1.AC1', table=True)[1]['fig']
+    fig2 = aplot('LVRN.MMB1.AC2', table=True)[1]['fig']
 
     # Load template and perform replacements
-    ppt = PowerPointTemplate(r'C:/Development/Powerpoint/Test.pptx')
+    ppt = PowerPointTemplate(r'C:/Development/Presentation_Automation/Test.pptx')
 
     # Replace image placeholder {Chart 1} with the matplotlib figure
     ppt.replace_image({
-        '{Chart}': fig
+        '{Chart 1}': fig1,
+        '{Chart 2}': fig2
     })
 
     # Replace text placeholder {Title} with some text
     ppt.replace_text({
-        'CompanyLogo': 'My Adjusted Title'
+        'Title1': 'My Adjusted Title'
     })
 
     # Save the output
-    ppt.save(r'C:/Development/Powerpoint/Test2.pptx')
+    ppt.save(r'C:/Development/Presentation_Automation/Test2.pptx')
     print("Saved output:")
 
     # Show the tracker report – you'll see both the image and text replacements recorded
@@ -778,5 +783,5 @@ if __name__ == '__main__':
     # The tracker will read the output geometries and prepare to adjust the template.
     ppt.tracker.update()  # This will now do nothing because the output is the same as saved.
     ppt.tracker.print_report()
-    ppt.update_template(r'C:/Development/Powerpoint/Test3_Template.pptx')
+    ppt.update_template(r'C:/Development/Presentation_Automation/New_Template.pptx')
     # print("Updated template saved:", new_template_path)
